@@ -91,6 +91,8 @@ impl<T: AsRef<[u8]>> ZipSliceArchive<T> {
             entry_data,
             base_offset: self.eocd.base_offset(),
             current_offset: directory_start,
+            remaining: self.eocd.strict.then_some(self.eocd.entries()),
+            minimum_local: self.eocd.directory_offset(),
         }
     }
 
@@ -192,6 +194,32 @@ impl<T: AsRef<[u8]>> ZipSliceArchive<T> {
         }
 
         let (entire_entry, descriptor) = header.split_at(total_size as usize);
+        if self.eocd.strict {
+            let central = data
+                .get(entry.central_directory_offset as usize..)
+                .ok_or(ErrorKind::Eof)?;
+            validate_strict_local(entire_entry, central)?;
+            let body_end = entry
+                .local_header_offset
+                .checked_add(total_size)
+                .ok_or(ErrorKind::Eof)?;
+            if body_end > self.eocd.directory_offset() {
+                return Err(ErrorKind::Eof.into());
+            }
+            if entry.has_data_descriptor {
+                let encoded = DataDescriptor::encoded_size(
+                    descriptor,
+                    entry.data_descriptor_uses_zip64_sizes,
+                )?;
+                let end = body_end.checked_add(encoded as u64).ok_or(ErrorKind::Eof)?;
+                if end > self.eocd.directory_offset() {
+                    return Err(ErrorKind::Eof.into());
+                }
+                let parsed =
+                    DataDescriptor::parse(descriptor, entry.data_descriptor_uses_zip64_sizes)?;
+                validate_strict_descriptor(&parsed, entry)?;
+            }
+        }
 
         Ok(ZipSliceEntry {
             data: entire_entry,
@@ -206,6 +234,64 @@ impl<T: AsRef<[u8]>> ZipSliceArchive<T> {
             descriptor,
         })
     }
+}
+
+fn validate_strict_descriptor(
+    descriptor: &DataDescriptor,
+    entry: ZipArchiveEntryWayfinder,
+) -> Result<(), Error> {
+    if descriptor.crc != entry.crc
+        || descriptor.compressed_size != entry.compressed_size
+        || descriptor.uncompressed_size != entry.uncompressed_size
+    {
+        return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+    }
+    Ok(())
+}
+
+fn validate_strict_local(local: &[u8], central: &[u8]) -> Result<(), Error> {
+    let local_header = ZipLocalFileHeaderFixed::parse(local)?;
+    let central_header = ZipFileHeaderFixed::parse(central)?;
+    let local_end = ZipLocalFileHeaderFixed::SIZE + local_header.variable_length();
+    let local_fields = local
+        .get(ZipLocalFileHeaderFixed::SIZE..local_end)
+        .ok_or(ErrorKind::Eof)?;
+    let (central_name, central_extra, _, _) = central_header
+        .parse_variable_length(&central[ZipFileHeaderFixed::SIZE..])
+        .ok_or(ErrorKind::Eof)?;
+    let (local_name, local_extra) = local_fields.split_at(local_header.file_name_len as usize);
+    if local_name != central_name
+        || local_header.flags != central_header.flags
+        || local_header.compression_method != central_header.compression_method
+    {
+        return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+    }
+    ZipFileHeaderRecord::validate_strict_extra(&central_header, central_extra)?;
+    let mut fields = ExtraFields::new(local_extra);
+    let mut zip64 = None;
+    for (id, bytes) in fields.by_ref() {
+        if id == ExtraFieldId::ZIP64 && zip64.replace(bytes).is_some() {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+        }
+    }
+    let required =
+        local_header.compressed_size == u32::MAX || local_header.uncompressed_size == u32::MAX;
+    if !fields.remaining_bytes().is_empty()
+        || required && zip64.is_none_or(|bytes| bytes.len() != 16)
+    {
+        return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+    }
+    let parsed =
+        ZipFileHeaderRecord::from_parts(central_header, central_name, central_extra, &[], 0);
+    let (compressed, uncompressed) = local_header_size_hints(&local_header, local_extra);
+    let dd = parsed.flags.has_data_descriptor();
+    if (!dd || local_header.crc32 != 0) && local_header.crc32 != parsed.crc32
+        || (!dd || compressed != 0) && compressed != parsed.compressed_size
+        || (!dd || uncompressed != 0) && uncompressed != parsed.uncompressed_size
+    {
+        return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+    }
+    Ok(())
 }
 
 /// Represents a single entry (file or directory) within a `ZipSliceArchive`.
@@ -361,6 +447,8 @@ pub struct ZipSliceEntries<'data> {
     entry_data: &'data [u8],
     base_offset: u64,
     current_offset: u64,
+    remaining: Option<u64>,
+    minimum_local: u64,
 }
 
 impl<'data> ZipSliceEntries<'data> {
@@ -376,7 +464,16 @@ impl<'data> ZipSliceEntries<'data> {
     #[inline(always)]
     fn next_file_entry(&mut self) -> Result<Option<ZipFileHeaderRecord<'data>>, Error> {
         if self.entry_data.is_empty() {
+            if self
+                .remaining
+                .is_some_and(|count| count != 0 || self.minimum_local != 0)
+            {
+                return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+            }
             return Ok(None);
+        }
+        if self.remaining == Some(0) {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
         }
 
         let file_header = match ZipFileHeaderFixed::parse(self.entry_data) {
@@ -389,6 +486,9 @@ impl<'data> ZipSliceEntries<'data> {
             return Err(Error::from(ErrorKind::Eof));
         };
 
+        if self.remaining.is_some() {
+            ZipFileHeaderRecord::validate_strict_extra(&file_header, extra_field)?;
+        }
         let mut entry = ZipFileHeaderRecord::from_parts(
             file_header,
             file_name,
@@ -396,9 +496,27 @@ impl<'data> ZipSliceEntries<'data> {
             file_comment,
             self.current_offset,
         );
-        entry.local_header_offset += self.base_offset;
-        self.current_offset += (self.entry_data.len() - entry_data.len()) as u64;
+        if self.remaining.is_some()
+            && (entry.disk_number_start != 0
+                || entry.local_header_offset == u64::MAX
+                || entry.compressed_size == u64::MAX
+                || entry.uncompressed_size == u64::MAX)
+        {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+        }
+        entry.local_header_offset = entry
+            .local_header_offset
+            .checked_add(self.base_offset)
+            .ok_or(ErrorKind::Eof)?;
+        self.minimum_local = self.minimum_local.min(entry.local_header_offset);
+        self.current_offset = self
+            .current_offset
+            .checked_add((self.entry_data.len() - entry_data.len()) as u64)
+            .ok_or(ErrorKind::Eof)?;
         self.entry_data = entry_data;
+        if let Some(count) = &mut self.remaining {
+            *count -= 1;
+        }
         Ok(Some(entry))
     }
 
@@ -413,7 +531,8 @@ impl<'data> ZipSliceEntries<'data> {
         &mut self,
         err: Error,
     ) -> Result<Option<ZipFileHeaderRecord<'data>>, Error> {
-        if self.entry_data.len() <= MAX_DIGITAL_SIGNATURE_SIZE
+        if self.remaining.is_none()
+            && self.entry_data.len() <= MAX_DIGITAL_SIGNATURE_SIZE
             && self.entry_data.starts_with(&DIGITAL_SIGNATURE_BYTES)
         {
             self.entry_data = &[];
@@ -626,17 +745,17 @@ fn local_header_size_hints(header: &ZipLocalFileHeaderFixed, extra_field: &[u8])
             }
 
             let mut field = field_data;
-            if header.uncompressed_size == u32::MAX {
-                if let Some(v) = field.get(..8).map(le_u64) {
-                    uncompressed_size = v;
-                    field = &field[8..];
-                }
+            if header.uncompressed_size == u32::MAX
+                && let Some(v) = field.get(..8).map(le_u64)
+            {
+                uncompressed_size = v;
+                field = &field[8..];
             }
 
-            if header.compressed_size == u32::MAX {
-                if let Some(v) = field.get(..8).map(le_u64) {
-                    compressed_size = v;
-                }
+            if header.compressed_size == u32::MAX
+                && let Some(v) = field.get(..8).map(le_u64)
+            {
+                compressed_size = v;
             }
 
             break;
@@ -695,8 +814,16 @@ pub(crate) struct DataDescriptor {
 impl DataDescriptor {
     /// The maximum on-disk size of a data descriptor: optional 4-byte
     /// signature + 4-byte crc + two 8-byte zip64 sizes.
-    #[cfg(feature = "std")]
     const MAX_SIZE: usize = 24;
+
+    fn encoded_size(data: &[u8], zip64: bool) -> Result<usize, Error> {
+        let first = data.get(..4).ok_or(ErrorKind::Eof)?;
+        Ok(if le_u32(first) == Self::SIGNATURE {
+            4
+        } else {
+            0
+        } + if zip64 { 20 } else { 12 })
+    }
     pub const SIGNATURE: u32 = 0x08074b50;
 
     /// Parses a data descriptor from `data`.
@@ -1190,6 +1317,26 @@ impl<'a> ZipFileHeaderRecord<'a> {
         result
     }
 
+    fn validate_strict_extra(header: &ZipFileHeaderFixed, extra: &[u8]) -> Result<(), Error> {
+        let required = usize::from(header.uncompressed_size == u32::MAX) * 8
+            + usize::from(header.compressed_size == u32::MAX) * 8
+            + usize::from(header.local_header_offset == u32::MAX) * 8
+            + usize::from(header.disk_number_start == u16::MAX) * 4;
+        let mut fields = ExtraFields::new(extra);
+        let mut zip64 = None;
+        for (id, data) in fields.by_ref() {
+            if id == ExtraFieldId::ZIP64 && zip64.replace(data).is_some() {
+                return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+            }
+        }
+        if !fields.remaining_bytes().is_empty()
+            || required != 0 && zip64.is_none_or(|data| data.len() != required)
+        {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+        }
+        Ok(())
+    }
+
     /// Describes if the file is a directory.
     ///
     /// See [`ZipFilePath::is_dir`] for more information.
@@ -1216,6 +1363,7 @@ impl<'a> ZipFileHeaderRecord<'a> {
             has_data_descriptor: self.flags().has_data_descriptor(),
             crc: self.crc32,
             data_descriptor_uses_zip64_sizes: self.data_descriptor_uses_zip64_sizes,
+            central_directory_offset: self.central_directory_offset,
         }
     }
 
@@ -1442,6 +1590,7 @@ pub struct ZipArchiveEntryWayfinder {
     crc: u32,
     has_data_descriptor: bool,
     data_descriptor_uses_zip64_sizes: bool,
+    central_directory_offset: u64,
 }
 
 impl ZipArchiveEntryWayfinder {

@@ -1,0 +1,19 @@
+{
+  "contract": "release-file-manifest-v1",
+  "files": {
+    "compact.zip": "b495c8c7264605158c47c1ebbb064e9b8f4f6fd1a7d8992f79315d07592122c1",
+    "empty-only.zip": "031a398950c2af46e1843993c0f4ed540873625727cb2e73f9c79c0b970a321c",
+    "manifest-archive-extra.zip": "97fbee5c45ef1c7f80e22b2550e55a6ac9fd220ed460ce33535a79baca2f2ed0",
+    "manifest-archive-missing.zip": "68504ffb530b2545991c5bfd949f76bbc0f5c89fe7d331193abe547204fb3a7f",
+    "manifest-device.zip": "679354a2a207ce7f61836e7e289225d48691e44c092f4a1e816159c3bd5167d0",
+    "manifest-directory.zip": "dd01d7681f3c73ca5bf7b00b57d52790b9166287e13111710957b4e099242229",
+    "manifest-duplicate.zip": "2c1bfb532ad3660fb57b352fc480e9f0eab4f4289cc971ab62baf9dcb3bd5cfe",
+    "manifest-file-digest-mismatch.zip": "fd85dc4748295ac50a4c2f72fc6eef3d44ebc8dc9a60be855f68c3ab759dd40a",
+    "manifest-file-size-mismatch.zip": "dd897f7e9e43e8a03afbc2f3f3586cfdf8b4d9d91a03a4ba2f509dd8985026ef",
+    "manifest-raw-mismatch.zip": "b495c8c7264605158c47c1ebbb064e9b8f4f6fd1a7d8992f79315d07592122c1",
+    "manifest-symlink.zip": "5193c4dec726bbde4a256015d87cada417a222a14d9c084dc9a9609ad286d8e1",
+    "raw-nofinal.zip": "8c81562986c749865974fd6766505051d5849fb0c2eb72cec3aafeb6e4ea662d",
+    "valid.zip": "9586c6d996d38ba69fa1726dded940d005ca0312b923998be9d112b8841198ac"
+  },
+  "source_commit": "26569159caa0d2f64960b163011996eabe497d83"
+}

@@ -29,6 +29,7 @@ const END_OF_CENTRAL_DIR_MAX_OFFSET: u64 = 1 << 20;
 #[derive(Debug)]
 pub struct ZipLocator {
     max_search_space: u64,
+    strict: bool,
 }
 
 impl Default for ZipLocator {
@@ -42,6 +43,15 @@ impl ZipLocator {
     pub fn new() -> Self {
         ZipLocator {
             max_search_space: END_OF_CENTRAL_DIR_MAX_OFFSET,
+            strict: false,
+        }
+    }
+
+    /// 严格读取纯ZIP，拒绝布局修补、字段冲突及不完整目录；失败不得回落通用政策。
+    pub fn strict() -> Self {
+        Self {
+            strict: true,
+            ..Self::new()
         }
     }
 
@@ -66,6 +76,12 @@ impl ZipLocator {
         let mut eocd = self
             .locate_in_byte_slice_impl(data, location)
             .map_err(|e| e.with_eocd_offset(location as u64))?;
+
+        if self.strict {
+            eocd.validate_strict_layout(data.len() as u64)?;
+            eocd.strict = true;
+            return Ok(eocd);
+        }
 
         // Transparently verify that the self reported central directory points
         // to a valid entry. If it is not a valid entry, we can attempt to
@@ -103,11 +119,19 @@ impl ZipLocator {
         location: usize,
     ) -> Result<EndOfCentralDirectory, Error> {
         let eocd = EndOfCentralDirectoryRecordFixed::parse(&data[location..])?;
+        if self.strict {
+            validate_classic_disk(&eocd)?;
+        }
 
         // Validate comment is completely present in the slice
-        let comment_start = location + EndOfCentralDirectoryRecordFixed::SIZE;
+        let comment_start = location
+            .checked_add(EndOfCentralDirectoryRecordFixed::SIZE)
+            .ok_or(ErrorKind::Eof)?;
         let comment_len = eocd.comment_len as usize;
-        if comment_start + comment_len > data.len() {
+        if comment_start
+            .checked_add(comment_len)
+            .is_none_or(|end| end > data.len())
+        {
             return Err(Error::from(ErrorKind::Eof));
         }
 
@@ -117,13 +141,19 @@ impl ZipLocator {
             .and_then(|start| Zip64EndOfCentralDirectoryLocatorRecord::parse(&data[start..]).ok());
 
         let Some(zip64_locator) = zip64_locator else {
+            if self.strict && requires_zip64(&eocd) {
+                return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+            }
             return EndOfCentralDirectory::create(EndOfCentralDirectoryRecord::from_parts(
                 location as u64,
                 &eocd,
             ));
         };
 
-        let zip64_eocd = &data[(zip64_locator.directory_offset as usize).min(data.len())..];
+        let zip64_start = usize::try_from(zip64_locator.directory_offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        let zip64_eocd = &data[zip64_start..];
         let zip64_record = match parse_zip64_candidate(
             zip64_eocd,
             &eocd,
@@ -132,6 +162,9 @@ impl ZipLocator {
         ) {
             Some(record) => record,
             None => {
+                if self.strict {
+                    return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+                }
                 return EndOfCentralDirectory::create(EndOfCentralDirectoryRecord::from_parts(
                     location as u64,
                     &eocd,
@@ -139,6 +172,9 @@ impl ZipLocator {
             }
         };
 
+        if self.strict {
+            validate_zip64_disk(&eocd, &zip64_locator, &zip64_record)?;
+        }
         let zip64 =
             Zip64EndOfCentralDirectory::from_parts(zip64_locator.directory_offset, zip64_record);
         let eocd = EndOfCentralDirectoryRecord::from_parts(location as u64, &eocd);
@@ -194,6 +230,7 @@ pub(crate) struct EndOfCentralDirectory {
     num_entries: u64,
     comment_len: u16,
     base_offset: u64,
+    pub(crate) strict: bool,
 }
 
 impl EndOfCentralDirectory {
@@ -206,6 +243,7 @@ impl EndOfCentralDirectory {
             num_entries: u64::from(eocd.num_entries),
             comment_len: eocd.comment_len,
             base_offset: 0,
+            strict: false,
         };
 
         result.validate()?;
@@ -224,10 +262,30 @@ impl EndOfCentralDirectory {
             num_entries: zip64.num_entries,
             comment_len: eocd.comment_len,
             base_offset: 0,
+            strict: false,
         };
 
         result.validate()?;
         Ok(result)
+    }
+
+    fn validate_strict_layout(&self, end: u64) -> Result<(), Error> {
+        let directory_end = self
+            .central_dir_offset
+            .checked_add(self.central_dir_size)
+            .ok_or(ErrorKind::InvalidEndOfCentralDirectory)?;
+        let archive_end = self
+            .eocd_offset
+            .checked_add(EndOfCentralDirectoryRecordFixed::SIZE as u64)
+            .and_then(|value| value.checked_add(u64::from(self.comment_len)))
+            .ok_or(ErrorKind::InvalidEndOfCentralDirectory)?;
+        if directory_end != self.head_eocd_offset() || archive_end != end {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+        }
+        if self.num_entries == 0 && self.central_dir_offset != 0 {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), Error> {
@@ -396,6 +454,37 @@ impl Zip64EndOfCentralDirectoryLocatorRecord {
 
         Ok(result)
     }
+}
+
+fn requires_zip64(eocd: &EndOfCentralDirectoryRecordFixed) -> bool {
+    eocd.num_entries == u16::MAX
+        || eocd.total_entries == u16::MAX
+        || eocd.central_dir_size == u32::MAX
+        || eocd.central_dir_offset == u32::MAX
+}
+
+fn validate_zip64_disk(
+    classic: &EndOfCentralDirectoryRecordFixed,
+    locator: &Zip64EndOfCentralDirectoryLocatorRecord,
+    record: &Zip64EndOfCentralDirectoryRecord,
+) -> Result<(), Error> {
+    validate_classic_disk(classic)?;
+    if locator.eocd_disk != 0
+        || locator.total_disks != 1
+        || record.disk_number != 0
+        || record.cd_disk != 0
+        || record.num_entries != record.total_entries
+    {
+        return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+    }
+    Ok(())
+}
+
+fn validate_classic_disk(eocd: &EndOfCentralDirectoryRecordFixed) -> Result<(), Error> {
+    if eocd.disk_number != 0 || eocd.eocd_disk != 0 || eocd.num_entries != eocd.total_entries {
+        return Err(Error::from(ErrorKind::InvalidEndOfCentralDirectory));
+    }
+    Ok(())
 }
 
 fn parse_zip64_candidate(

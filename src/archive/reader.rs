@@ -124,6 +124,8 @@ impl<R> ZipArchive<R> {
             offset: self.eocd.directory_offset(),
             base_offset: self.eocd.base_offset(),
             central_dir_end_pos: self.eocd.head_eocd_offset(),
+            remaining: self.eocd.strict.then_some(self.eocd.entries()),
+            minimum_local: self.eocd.directory_offset(),
         }
     }
 
@@ -241,6 +243,48 @@ where
 
         if o1 || o2 || o3 {
             return Err(Error::from(ErrorKind::Eof));
+        }
+
+        if self.eocd.strict {
+            if body_end_offset > self.eocd.directory_offset() {
+                return Err(ErrorKind::Eof.into());
+            }
+            // 同一reader重读库拥有的结构，字段上限为ZIP固定u16范围，不复制业务parser。
+            let mut local = vec![0; ZipLocalFileHeaderFixed::SIZE + file_header.variable_length()];
+            self.reader
+                .read_exact_at(&mut local, entry.local_header_offset)?;
+            let mut central_fixed = [0; ZipFileHeaderFixed::SIZE];
+            self.reader
+                .read_exact_at(&mut central_fixed, entry.central_directory_offset)?;
+            let central_header = ZipFileHeaderFixed::parse(&central_fixed)?;
+            let mut central = vec![0; ZipFileHeaderFixed::SIZE + central_header.variable_length()];
+            self.reader
+                .read_exact_at(&mut central, entry.central_directory_offset)?;
+            validate_strict_local(&local, &central)?;
+            if entry.has_data_descriptor {
+                let mut raw = [0; DataDescriptor::MAX_SIZE];
+                let available = self
+                    .eocd
+                    .directory_offset()
+                    .checked_sub(body_end_offset)
+                    .ok_or(ErrorKind::Eof)?;
+                let size = available.min(DataDescriptor::MAX_SIZE as u64) as usize;
+                self.reader
+                    .read_exact_at(&mut raw[..size], body_end_offset)?;
+                let descriptor =
+                    DataDescriptor::parse(&raw[..size], entry.data_descriptor_uses_zip64_sizes)?;
+                let encoded = DataDescriptor::encoded_size(
+                    &raw[..size],
+                    entry.data_descriptor_uses_zip64_sizes,
+                )?;
+                if body_end_offset
+                    .checked_add(encoded as u64)
+                    .is_none_or(|end| end > self.eocd.directory_offset())
+                {
+                    return Err(ErrorKind::Eof.into());
+                }
+                validate_strict_descriptor(&descriptor, entry)?;
+            }
         }
 
         Ok(ZipEntry {
@@ -397,8 +441,11 @@ where
         }
 
         let variable_data = &mut buffer[..total_variable_len];
-        let variable_data_offset =
-            self.entry.local_header_offset + ZipLocalFileHeaderFixed::SIZE as u64;
+        let variable_data_offset = self
+            .entry
+            .local_header_offset
+            .checked_add(ZipLocalFileHeaderFixed::SIZE as u64)
+            .ok_or(ErrorKind::Eof)?;
         self.archive
             .get_ref()
             .read_exact_at(variable_data, variable_data_offset)?;
@@ -447,7 +494,10 @@ where
 
         let read = self.reader.read(buf)?;
         self.crc.update(&buf[..read]);
-        self.size += read as u64;
+        self.size = self
+            .size
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("解压字节计数溢出"))?;
 
         if read == 0 || self.size >= self.verifier.uncompressed_size {
             self.verifier
@@ -521,6 +571,8 @@ pub struct ZipEntries<'archive, 'buf, R> {
     offset: u64,
     base_offset: u64,
     central_dir_end_pos: u64,
+    remaining: Option<u64>,
+    minimum_local: u64,
 }
 
 impl<R> ZipEntries<'_, '_, R>
@@ -540,11 +592,22 @@ where
     // extraction benchmark, it is still yielded as 12% improvement when just iterating.
     #[inline(always)]
     fn next_entry_impl(&mut self) -> Result<Option<ZipFileHeaderRecord<'_>>, Error> {
+        let exhausted = self.offset >= self.central_dir_end_pos && self.pos == self.end;
+        if exhausted
+            && self
+                .remaining
+                .is_some_and(|count| count != 0 || self.minimum_local != 0)
+            || !exhausted && self.remaining == Some(0)
+        {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+        }
         if self.pos + ZipFileHeaderFixed::SIZE > self.end {
             if self.offset >= self.central_dir_end_pos {
                 return if self.pos == self.end {
                     Ok(None)
-                } else if self.buffer[self.pos..self.end].starts_with(&DIGITAL_SIGNATURE_BYTES) {
+                } else if self.remaining.is_none()
+                    && self.buffer[self.pos..self.end].starts_with(&DIGITAL_SIGNATURE_BYTES)
+                {
                     self.pos = self.end;
                     Ok(None)
                 } else {
@@ -562,7 +625,7 @@ where
                 min_read,
                 self.offset,
             )?;
-            self.offset += read as u64;
+            self.offset = self.offset.checked_add(read as u64).ok_or(ErrorKind::Eof)?;
             self.pos = 0;
             self.end = remaining + read;
         }
@@ -602,7 +665,7 @@ where
                 variable_length - remaining,
                 self.offset,
             )?;
-            self.offset += read as u64;
+            self.offset = self.offset.checked_add(read as u64).ok_or(ErrorKind::Eof)?;
             self.pos = 0;
             self.end = remaining + read;
         }
@@ -611,6 +674,9 @@ where
         let (file_name, extra_field, file_comment, _) = file_header
             .parse_variable_length(data)
             .expect("variable length precheck failed");
+        if self.remaining.is_some() {
+            ZipFileHeaderRecord::validate_strict_extra(&file_header, extra_field)?;
+        }
         let mut file_header = ZipFileHeaderRecord::from_parts(
             file_header,
             file_name,
@@ -618,8 +684,23 @@ where
             file_comment,
             central_directory_offset,
         );
-        file_header.local_header_offset += self.base_offset;
+        if self.remaining.is_some()
+            && (file_header.disk_number_start != 0
+                || file_header.local_header_offset == u64::MAX
+                || file_header.compressed_size == u64::MAX
+                || file_header.uncompressed_size == u64::MAX)
+        {
+            return Err(ErrorKind::InvalidEndOfCentralDirectory.into());
+        }
+        file_header.local_header_offset = file_header
+            .local_header_offset
+            .checked_add(self.base_offset)
+            .ok_or(ErrorKind::Eof)?;
+        self.minimum_local = self.minimum_local.min(file_header.local_header_offset);
         self.pos += variable_length;
+        if let Some(count) = &mut self.remaining {
+            *count -= 1;
+        }
         Ok(Some(file_header))
     }
 
@@ -635,7 +716,9 @@ where
         err: Error,
     ) -> Result<Option<ZipFileHeaderRecord<'_>>, Error> {
         let central_directory_offset = self.offset - (self.end - self.pos) as u64;
-        if self.central_dir_end_pos - central_directory_offset <= MAX_DIGITAL_SIGNATURE_SIZE as u64
+        if self.remaining.is_none()
+            && self.central_dir_end_pos - central_directory_offset
+                <= MAX_DIGITAL_SIGNATURE_SIZE as u64
             && self.buffer[self.pos..self.end].starts_with(&DIGITAL_SIGNATURE_BYTES)
         {
             self.pos = self.end;

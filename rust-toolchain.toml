@@ -1,0 +1,5 @@
+# 与已存在的Node/Core真实消费者编译基线一致，本片不升级那些仓库。
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+profile = "minimal"

@@ -132,6 +132,14 @@ impl ZipLocator {
             .locate_in_reader_impl(reader, buffer, eocd_offset, buffer_pos, buffer_valid_len)
             .map_err(|(reader, e)| (reader, e.with_eocd_offset(eocd_offset)))?;
 
+        if self.strict {
+            if let Err(error) = eocd.validate_strict_layout(end_offset) {
+                return Err((reader, error));
+            }
+            eocd.strict = true;
+            return Ok(ZipArchive::new(reader, eocd));
+        }
+
         // Check first entry in central directory, see
         // `ZipLocator::locate_in_byte_slice` for more info
         let first_entry = reader
@@ -202,6 +210,11 @@ impl ZipLocator {
             }
         };
 
+        if self.strict
+            && let Err(error) = validate_classic_disk(&eocd)
+        {
+            return Err((reader.inner, error));
+        }
         end_of_central_directory =
             &end_of_central_directory[EndOfCentralDirectoryRecordFixed::SIZE..];
 
@@ -210,13 +223,21 @@ impl ZipLocator {
         // Check if the rest of the buffer doesn't completely contain the comment.
         if end_of_central_directory.len() < comment_len {
             let pos = end_of_central_directory.len();
-            let comment_offset =
-                eocd_offset + EndOfCentralDirectoryRecordFixed::SIZE as u64 + pos as u64;
+            let Some(comment_offset) = eocd_offset
+                .checked_add(EndOfCentralDirectoryRecordFixed::SIZE as u64)
+                .and_then(|offset| offset.checked_add(pos as u64))
+            else {
+                return Err((reader.inner, ErrorKind::Eof.into()));
+            };
             let remaining_comment_len = comment_len - pos;
 
             // Try to read a single byte to validate the rest of the comment is accessible
             let mut temp_buf = [0u8; 1];
-            let end_comment_offset = comment_offset + remaining_comment_len as u64 - 1;
+            let Some(end_comment_offset) =
+                comment_offset.checked_add(remaining_comment_len as u64 - 1)
+            else {
+                return Err((reader.inner, ErrorKind::Eof.into()));
+            };
             if let Err(e) = reader.read_exact_at(&mut temp_buf, end_comment_offset) {
                 return Err((reader.inner, Error::io(e)));
             }
@@ -226,6 +247,9 @@ impl ZipLocator {
 
         // Always probe for a zip64 EOCD locator, which can be present without sentinels
         if (eocd64l_size as u64) > eocd_offset {
+            if self.strict && requires_zip64(&eocd) {
+                return Err((reader.inner, ErrorKind::InvalidEndOfCentralDirectory.into()));
+            }
             return finish_classic_eocd(
                 reader,
                 EndOfCentralDirectoryRecord::from_parts(eocd_offset, &eocd),
@@ -252,6 +276,9 @@ impl ZipLocator {
         let zip64_locator = match Zip64EndOfCentralDirectoryLocatorRecord::parse(zip64l_eocd) {
             Ok(locator) => locator,
             Err(_) => {
+                if self.strict && requires_zip64(&eocd) {
+                    return Err((reader.inner, ErrorKind::InvalidEndOfCentralDirectory.into()));
+                }
                 return finish_classic_eocd(
                     reader,
                     EndOfCentralDirectoryRecord::from_parts(eocd_offset, &eocd),
@@ -278,6 +305,9 @@ impl ZipLocator {
                 // treat it as a false-positive locator and use the classic
                 // EOCD. Propagate other I/O failures.
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    if self.strict {
+                        return Err((reader.inner, Error::io(e)));
+                    }
                     return finish_classic_eocd(
                         reader,
                         EndOfCentralDirectoryRecord::from_parts(eocd_offset, &eocd),
@@ -301,6 +331,9 @@ impl ZipLocator {
         ) {
             Some(record) => record,
             None => {
+                if self.strict {
+                    return Err((reader.inner, ErrorKind::InvalidEndOfCentralDirectory.into()));
+                }
                 return finish_classic_eocd(
                     reader,
                     EndOfCentralDirectoryRecord::from_parts(eocd_offset, &eocd),
@@ -308,6 +341,11 @@ impl ZipLocator {
             }
         };
 
+        if self.strict
+            && let Err(error) = validate_zip64_disk(&eocd, &zip64_locator, &zip64_record)
+        {
+            return Err((reader.inner, error));
+        }
         // todo: zip64 extensible data sector
 
         let zip_eocd =
